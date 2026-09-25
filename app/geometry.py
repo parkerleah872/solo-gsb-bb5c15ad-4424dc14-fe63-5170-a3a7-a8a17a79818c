@@ -91,6 +91,14 @@ def _refract(
     return (eta * direction[0] + k * normal[0], eta * direction[1] + k * normal[1])
 
 
+def cauchy_refractive_index(a: float, b: float, wavelength_um: float) -> float:
+    """柯西（Cauchy）色散公式：n(λ) = A + B/λ²。
+
+    波长 λ 以微米计，故 B 的量纲为 μm²。
+    """
+    return a + b / (wavelength_um * wavelength_um)
+
+
 def fresnel_transmittance(
     direction: tuple[float, float],
     normal: tuple[float, float],
@@ -969,4 +977,148 @@ def refractive_index_calibration(
         "scan": [(p.n_next, p.valid, p.mse) for p in scan_points],
         "refined": [(n_next, p.mse) for n_next, p in refined_points],
         "best": best,
+    }
+
+
+def chromatic_beam_evaluation(
+    start: tuple[float, float],
+    center_direction: tuple[float, float],
+    half_angle_deg: float,
+    sample_count: int,
+    start_cauchy: tuple[float, float],
+    interface_cauchy: list[tuple[tuple[float, float], tuple[float, float], tuple[float, float]]],
+    observation_point_in: tuple[float, float],
+    observation_normal: tuple[float, float],
+    wavelengths: list[float],
+) -> dict:
+    """多波长扇形光束在观察线上的横向色差评估（复用现有采样、追迹与观察线求交）。
+
+    对每个波长 λ 按柯西公式 n = A + B/λ² 计算起始介质与各顺序界面后的介质
+    折射率（start_cauchy 为起始介质 (A, B)，interface_cauchy 为各界面
+    (point, normal, (A, B))，(A, B) 为该界面后下一介质的柯西系数），复用
+    sample_directions 的扇形采样、trace_ray 的顺序界面追迹与
+    observation_intersection 的观察线前向求交。
+
+    仅当某同序号光线在**所有波长**下均追迹完成（completed）且与观察线存在
+    前向交点时，该光线才计入共通样本。共通样本非空时，逐波长基于共通样本
+    的交点计算质心、RMS 半径与相对首个波长（wavelengths[0]）的质心切向
+    位移；共通样本为空时三者均为 null。切向量 t 为观察线单位法线逆时针
+    旋转 90° 所得单位切向量，质心切向位移 = (本波长质心 − 首波长质心) · t。
+
+    返回 dict：
+      wavelengths / ray_count / tangent；
+      common_sample_count / common_ray_indices；
+      wavelengths 对应每波长:
+        wavelength, n_start, n_next（各界面折射率列表）, hit_count,
+        centroid|None, rms_radius|None, centroid_tangential_offset|None；
+      rays: 每条采样光线按波长列出 emission_angle_deg, direction, wavelength,
+            status, reason, observation_point|None, common。
+    """
+    nrm = normalize(observation_normal)
+    tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+    samples = sample_directions(center_direction, half_angle_deg, sample_count)
+    ray_count = len(samples)
+
+    # 每波长逐条光线追迹：results[k][i] = (status, reason, point|None, direction, angle)
+    results: list[list[tuple[str, str | None, tuple[float, float] | None,
+                             tuple[float, float], float]]] = []
+    wavelength_stats: list[dict] = []
+    for wavelength in wavelengths:
+        n_start = cauchy_refractive_index(start_cauchy[0], start_cauchy[1], wavelength)
+        n_next_list = [
+            cauchy_refractive_index(a, b, wavelength)
+            for _point, _normal, (a, b) in interface_cauchy
+        ]
+        interfaces = [
+            (point, normal, n_next)
+            for (point, normal, (_a, _b)), n_next in zip(interface_cauchy, n_next_list)
+        ]
+        per_ray: list[
+            tuple[str, str | None, tuple[float, float] | None,
+                  tuple[float, float], float]
+        ] = []
+        hit_points: list[tuple[int, tuple[float, float]]] = []
+        for idx, (angle, direction) in enumerate(samples):
+            segments, status, reason = trace_ray(
+                start, direction, n_start, interfaces
+            )
+            point = None
+            if status == "completed":
+                point = observation_intersection(
+                    segments, observation_point_in, observation_normal
+                )
+                if point is not None:
+                    hit_points.append((idx, point))
+            per_ray.append((status, reason, point, direction, angle))
+        results.append(per_ray)
+        wavelength_stats.append(
+            {
+                "wavelength": wavelength,
+                "n_start": n_start,
+                "n_next": n_next_list,
+                "hit_count": len(hit_points),
+            }
+        )
+
+    # 共通样本：所有波长均追迹完成且前向命中观察线的同序号光线
+    common_indices = [
+        idx
+        for idx in range(ray_count)
+        if all(results[k][idx][2] is not None for k in range(len(wavelengths)))
+    ]
+
+    # 基于共通样本逐波长统计
+    first_centroid: tuple[float, float] | None = None
+    for k, stat in enumerate(wavelength_stats):
+        points = [results[k][idx][2] for idx in common_indices]
+        stats = centroid_and_rms(points)
+        if stats is None:
+            stat["centroid"] = None
+            stat["rms_radius"] = None
+            stat["centroid_tangential_offset"] = None
+        else:
+            centroid, rms = stats
+            stat["centroid"] = centroid
+            stat["rms_radius"] = rms
+            if k == 0:
+                first_centroid = centroid
+                stat["centroid_tangential_offset"] = 0.0
+            else:
+                stat["centroid_tangential_offset"] = (
+                    (centroid[0] - first_centroid[0]) * tangent[0]
+                    + (centroid[1] - first_centroid[1]) * tangent[1]
+                )
+
+    # 逐光线逐波长明细（外层按光线，内层按波长）
+    rays_out: list[dict] = []
+    common_set = set(common_indices)
+    for idx, (_angle, _direction) in enumerate(samples):
+        per_wavelength: list[dict] = []
+        for k, stat in enumerate(wavelength_stats):
+            status, reason, point, direction, angle = results[k][idx]
+            per_wavelength.append(
+                {
+                    "wavelength": stat["wavelength"],
+                    "status": status,
+                    "reason": reason,
+                    "observation_point": point,
+                    "common": idx in common_set,
+                }
+            )
+        rays_out.append(
+            {
+                "emission_angle_deg": _angle,
+                "direction": _direction,
+                "per_wavelength": per_wavelength,
+            }
+        )
+
+    return {
+        "wavelengths": list(wavelengths),
+        "ray_count": ray_count,
+        "common_sample_count": len(common_indices),
+        "common_ray_indices": common_indices,
+        "tangent": tangent,
+        "wavelength_results": wavelength_stats,
+        "rays": rays_out,
     }

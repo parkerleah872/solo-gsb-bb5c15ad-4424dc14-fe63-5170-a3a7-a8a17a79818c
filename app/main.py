@@ -33,6 +33,11 @@ POST /api/focus-searches              光线只追迹一次，将观察线沿单
 POST /api/refractive-index-calibrations 固定其余界面只替换目标界面 n_next，沿观察线
                                       切向偏移均方残差扫描 + 低谷黄金分割细化，
                                       返回最优折射率与逐光线预测偏移/残差（不入库）
+POST /api/chromatic-beam-evaluations 多波长（柯西色散 n=A+B/λ²）复用扇形采样、
+                                      顺序界面追迹与观察线前向求交，仅以所有波长
+                                      均完成追迹且命中观察线的同序号光线为共通样本，
+                                      逐波长返回质心、RMS 半径与相对首波长的质心
+                                      切向位移，以及逐光线逐波长状态与交点（不入库）
 """
 from __future__ import annotations
 
@@ -46,6 +51,7 @@ from .geometry import (
     aim_solutions,
     alignment_sensitivities,
     centroid_and_rms,
+    chromatic_beam_evaluation,
     focus_search,
     linear_least_squares,
     normalize,
@@ -67,6 +73,8 @@ from .schemas import (
     ApertureBeamRequest,
     BeamEvaluationOut,
     BeamRequest,
+    ChromaticBeamEvaluationOut,
+    ChromaticBeamRequest,
     DetectorPowerEvaluationOut,
     DetectorPowerRequest,
     FocusSearchOut,
@@ -813,4 +821,98 @@ def calibrate_refractive_index(req: RefractiveIndexCalibrationRequest) -> dict:
                 ],
             }
         ),
+    }
+
+
+@app.post("/api/chromatic-beam-evaluations", response_model=ChromaticBeamEvaluationOut)
+def evaluate_chromatic_beam(req: ChromaticBeamRequest) -> dict:
+    """多波长扇形光束追迹，评估观察线上的横向色差。
+
+    沿用光束评估的起点、中心方向、扇形半角、采样数与观察线；另收 2～9 个
+    互异的可见光波长（0.38～0.78 微米）及起始介质与各顺序界面后介质的
+    柯西系数 A、B。每个波长按 n = A + B/λ² 得到各介质折射率，复用现有
+    扇形采样、顺序界面追迹与观察线前向求交。
+
+    仅以在所有波长下均追迹完成（completed）且与观察线存在前向交点的
+    **同序号**光线作为**共通样本**；共通样本非空时，逐波长基于共通样本
+    交点计算质心、RMS 半径与相对首个波长（请求 wavelengths_um 的首项）
+    的质心切向位移（沿观察线单位切向量，即法线逆时针旋转 90°），共通
+    样本为空时统计量为 null。返回逐光线逐波长的状态、观察线交点与
+    common 标记、共通样本编号与数量，以及各波长折射率与统计。该接口
+    为即时计算，结果不写入数据库。
+    """
+    start_cauchy = (req.start_cauchy.A, req.start_cauchy.B)
+    interfaces = [
+        (
+            itf.point.as_tuple(),
+            itf.normal.as_tuple(),
+            (itf.cauchy.A, itf.cauchy.B),
+        )
+        for itf in req.interfaces
+    ]
+    result = chromatic_beam_evaluation(
+        req.start.as_tuple(),
+        req.center_direction.as_tuple(),
+        req.half_angle_deg,
+        req.sample_count,
+        start_cauchy,
+        interfaces,
+        req.observation_line.point.as_tuple(),
+        req.observation_line.normal.as_tuple(),
+        req.wavelengths_um,
+    )
+    return {
+        "half_angle_deg": req.half_angle_deg,
+        "sample_count": req.sample_count,
+        "ray_count": result["ray_count"],
+        "wavelengths_um": result["wavelengths"],
+        "common_sample_count": result["common_sample_count"],
+        "common_ray_indices": result["common_ray_indices"],
+        "tangent": {
+            "x": result["tangent"][0],
+            "y": result["tangent"][1],
+        },
+        "wavelength_results": [
+            {
+                "wavelength": stat["wavelength"],
+                "n_start": stat["n_start"],
+                "n_next": stat["n_next"],
+                "hit_count": stat["hit_count"],
+                "centroid": (
+                    None
+                    if stat["centroid"] is None
+                    else {"x": stat["centroid"][0], "y": stat["centroid"][1]}
+                ),
+                "rms_radius": stat["rms_radius"],
+                "centroid_tangential_offset": stat["centroid_tangential_offset"],
+            }
+            for stat in result["wavelength_results"]
+        ],
+        "rays": [
+            {
+                "emission_angle_deg": ray["emission_angle_deg"],
+                "direction": {
+                    "x": ray["direction"][0],
+                    "y": ray["direction"][1],
+                },
+                "per_wavelength": [
+                    {
+                        "wavelength": item["wavelength"],
+                        "status": item["status"],
+                        "reason": item["reason"],
+                        "observation_point": (
+                            None
+                            if item["observation_point"] is None
+                            else {
+                                "x": item["observation_point"][0],
+                                "y": item["observation_point"][1],
+                            }
+                        ),
+                        "common": item["common"],
+                    }
+                    for item in ray["per_wavelength"]
+                ],
+            }
+            for ray in result["rays"]
+        ],
     }

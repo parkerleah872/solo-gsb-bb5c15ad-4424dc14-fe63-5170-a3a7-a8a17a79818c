@@ -550,3 +550,134 @@ class RefractiveIndexCalibrationOut(BaseModel):
     scan: list[CalibrationScanPointOut]
     refined: list[CalibrationRefinedPointOut]
     best: CalibrationBestOut | None
+
+
+class CauchyCoefficientsIn(BaseModel):
+    """柯西色散系数：n(λ) = A + B/λ²，波长 λ 以微米计，B 量纲为 μm²。
+
+    A、B 均须为有限值；由此计算出的折射率还须为有限的正值。
+    """
+
+    A: float = Field(allow_inf_nan=False, description="柯西系数 A，必须为有限值")
+    B: float = Field(
+        allow_inf_nan=False, description="柯西系数 B（μm²），必须为有限值"
+    )
+
+
+class ChromaticInterfaceIn(BaseModel):
+    """一个顺序界面：线上一点、指向下一介质的法线与下一介质柯西系数。"""
+
+    point: Vec2
+    normal: Vec2
+    cauchy: CauchyCoefficientsIn
+
+    @field_validator("normal")
+    @classmethod
+    def normal_nonzero(cls, v: Vec2) -> Vec2:
+        if math.hypot(v.x, v.y) < _EPS:
+            raise ValueError("法线不能为零向量")
+        return v
+
+
+class ChromaticBeamRequest(BaseModel):
+    """多波长横向色差评估请求。
+
+    沿用光束起点、中心方向、扇形半角、采样数与观察线；另给 2～9 个互异的
+    可见光波长（0.38～0.78 微米，含端点），起始介质与各顺序界面后的介质
+    分别给出柯西系数 A、B（n = A + B/λ²）。系数及由其算出的各波长折射率
+    均须为有限值，且折射率为正。
+    """
+
+    start: Vec2
+    center_direction: Vec2
+    half_angle_deg: float = Field(gt=0, lt=90, description="对称半角（度），0<a<90")
+    sample_count: int = Field(ge=2, le=101, description="采样数，2～101（含端点）")
+    wavelengths_um: list[float] = Field(
+        min_length=2, max_length=9, description="2～9 个互异可见光波长（微米），0.38～0.78"
+    )
+    start_cauchy: CauchyCoefficientsIn
+    interfaces: list[ChromaticInterfaceIn] = Field(default_factory=list)
+    observation_line: ObservationLineIn
+
+    @field_validator("center_direction")
+    @classmethod
+    def direction_nonzero(cls, v: Vec2) -> Vec2:
+        if math.hypot(v.x, v.y) < _EPS:
+            raise ValueError("中心方向不能为零向量")
+        return v
+
+    @field_validator("wavelengths_um")
+    @classmethod
+    def wavelengths_valid(cls, v: list[float]) -> list[float]:
+        for w in v:
+            if not math.isfinite(w):
+                raise ValueError("波长必须为有限值")
+            if not (0.38 <= w <= 0.78):
+                raise ValueError("波长必须位于 0.38～0.78 微米之间（含端点）")
+        seen: list[float] = []
+        for w in v:
+            if any(w == s for s in seen):
+                raise ValueError(f"波长必须互异，发现重复波长 {w}")
+            seen.append(w)
+        return v
+
+    @model_validator(mode="after")
+    def refractive_indices_positive(self) -> "ChromaticBeamRequest":
+        coeffs = [(self.start_cauchy.A, self.start_cauchy.B)]
+        coeffs.extend((itf.cauchy.A, itf.cauchy.B) for itf in self.interfaces)
+        for a, b in coeffs:
+            for w in self.wavelengths_um:
+                n = a + b / (w * w)
+                if not math.isfinite(n) or n <= 0:
+                    raise ValueError(
+                        f"由柯西系数 A={a}, B={b} 与波长 {w} 微米计算的折射率 "
+                        f"{n} 必须为有限的正值"
+                    )
+        return self
+
+
+class ChromaticRayWavelengthOut(BaseModel):
+    """单条光线在单个波长下的追迹状态与观察线交点；common 表示是否属共通样本。"""
+
+    wavelength: float
+    status: str
+    reason: str | None
+    observation_point: Vec2 | None
+    common: bool
+
+
+class ChromaticRayOut(BaseModel):
+    """单条采样光线在各波长下的结果（波长顺序与请求一致）。"""
+
+    emission_angle_deg: float
+    direction: Vec2
+    per_wavelength: list[ChromaticRayWavelengthOut]
+
+
+class ChromaticWavelengthStatOut(BaseModel):
+    """单个波长的折射率与基于共通样本的光斑统计。
+
+    共通样本为空时 centroid / rms_radius / centroid_tangential_offset 为 null；
+    centroid_tangential_offset 为质心沿观察线切向量相对首个波长质心的有符号
+    位移，首个波长恒为 0。
+    """
+
+    wavelength: float
+    n_start: float
+    n_next: list[float]
+    hit_count: int
+    centroid: Vec2 | None
+    rms_radius: float | None
+    centroid_tangential_offset: float | None
+
+
+class ChromaticBeamEvaluationOut(BaseModel):
+    half_angle_deg: float
+    sample_count: int
+    ray_count: int
+    wavelengths_um: list[float]
+    common_sample_count: int
+    common_ray_indices: list[int]
+    tangent: Vec2
+    wavelength_results: list[ChromaticWavelengthStatOut]
+    rays: list[ChromaticRayOut]

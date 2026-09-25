@@ -40,6 +40,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/alignment-sensitivities` | 基准追迹后逐界面将法线旋转 ±扰动角重新追迹，中心差分求观察线偏移对法线角度的导数（不入库） |
 | POST | `/api/focus-searches` | 光线只追迹一次，沿观察线单位法线等距平移扫描光斑质心/RMS，对命中集合相同的低谷黄金分割细化，返回 RMS 最小的焦点位置（不入库） |
 | POST | `/api/refractive-index-calibrations` | 固定其余界面只替换目标界面 `n_next`，沿观察线切向偏移均方残差等距扫描 + 低谷黄金分割细化，返回最优折射率与逐光线预测偏移/残差（不入库） |
+| POST | `/api/chromatic-beam-evaluations` | 多波长（柯西色散 n=A+B/λ²）复用扇形采样、顺序界面追迹与观察线前向求交，仅以所有波长均完成追迹且命中观察线的同序号光线为共通样本，逐波长返回质心、RMS 半径与相对首波长的质心切向位移（不入库） |
 
 ### 请求示例
 
@@ -784,12 +785,105 @@ curl -X POST http://localhost:8000/api/refractive-index-calibrations \
 
 服务地址：API 根路径 http://localhost:8000 ，交互式文档（可在线试调该接口）http://localhost:8000/docs 。
 
+## 多波长横向色差评估
+
+`POST /api/chromatic-beam-evaluations` 沿用光束评估的**起点、中心方向、扇形半角、采样数与观察线**，另给 **2～9 个互异的可见光波长** `wavelengths_um`（**0.38～0.78 微米**，含端点，顺序即评估顺序，**首个波长作为位移基准**）以及**起始介质** `start_cauchy` 和**各顺序界面后介质** `interfaces[].cauchy` 的柯西系数 `A`、`B`。每个波长按**柯西色散公式** `n = A + B/λ²`（λ 以微米计，B 量纲为 μm²）得到各介质折射率，复用现有扇形采样、顺序界面追迹与观察线前向求交。该接口为即时计算，结果不写入数据库。
+
+- **折射率与校验**：柯西系数 `A`、`B` 必须为**有限值**（允许 `B` 为负，只要算出的折射率仍为正）；对每个给定波长算出的起始介质与各界面折射率均须为**有限的正值**，否则返回 `422`。波长必须为有限值、落在 `[0.38, 0.78]` 微米内且**两两互异**；数量必须为 2～9 个。
+- **共通样本**：仅以在**所有波长**下均追迹完成（`completed`）且与观察线存在**前向**交点的**同序号**光线作为共通样本（`common_sample_count`，编号列表 `common_ray_indices`）；逐光线逐波长结果中的 `common` 标记该光线是否属于共通样本（同一条光线在各波长下的标记一致）。
+- **逐波长统计**：共通样本非空时，各波长基于共通样本的观察线交点计算**质心** `centroid`、**RMS 半径** `rms_radius`，以及**相对首个波长的质心切向位移** `centroid_tangential_offset`——沿观察线单位切向量 `t`（法线归一化后逆时针旋转 90°，响应中回显为 `tangent`）的有符号位移 `(本波长质心 − 首波长质心) · t`，首个波长恒为 `0`。**共通样本为空时三者均为 `null`**（即使某些波长自身仍有命中，也不做统计，以保证各波长在同一组光线上可比）。
+- **逐波长命中数** `hit_count`：该波长自身追迹完成且前向命中观察线的光线数（不要求其他波长命中）；未完成（全反射 / 中途无交点）或未前向命中观察线的光线 `status` 给出原因，`observation_point` 为 `null`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/chromatic-beam-evaluations` | 多波长柯西色散扇形光束追迹，返回逐光线逐波长状态/交点与共通样本上的逐波长质心、RMS 与相对首波长质心切向位移 |
+
+### 横向色差评估请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/chromatic-beam-evaluations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "center_direction": {"x": 1, "y": 0},
+    "half_angle_deg": 5,
+    "sample_count": 5,
+    "wavelengths_um": [0.4, 0.55, 0.7],
+    "start_cauchy": {"A": 1.0, "B": 0.0},
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "cauchy": {"A": 1.5, "B": 0.004}},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "cauchy": {"A": 1.0, "B": 0.0}}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}}
+  }'
+```
+
+### 横向色差评估响应说明
+
+```json
+{
+  "half_angle_deg": 5.0,
+  "sample_count": 5,
+  "ray_count": 5,
+  "wavelengths_um": [0.4, 0.55, 0.7],
+  "common_sample_count": 5,
+  "common_ray_indices": [0, 1, 2, 3, 4],
+  "tangent": {"x": 0.0, "y": 1.0},
+  "wavelength_results": [
+    {
+      "wavelength": 0.4,
+      "n_start": 1.0,
+      "n_next": [1.525, 1.0],
+      "hit_count": 5,
+      "centroid": {"x": 10.0, "y": 0.0},
+      "rms_radius": 0.5756740928958641,
+      "centroid_tangential_offset": 0.0
+    },
+    {
+      "wavelength": 0.55,
+      "n_start": 1.0,
+      "n_next": [1.5132231404958678, 1.0],
+      "hit_count": 5,
+      "centroid": {"x": 10.0, "y": 2.22e-17},
+      "rms_radius": 0.576305888628506,
+      "centroid_tangential_offset": 2.22e-17
+    },
+    {
+      "wavelength": 0.7,
+      "n_start": 1.0,
+      "n_next": [1.5081632653061225, 1.0],
+      "hit_count": 5,
+      "centroid": {"x": 10.0, "y": 0.0},
+      "rms_radius": 0.5765803801167375,
+      "centroid_tangential_offset": 0.0
+    }
+  ],
+  "rays": [
+    {
+      "emission_angle_deg": -5.0,
+      "direction": {"x": 0.9961946980917455, "y": -0.08715574274765814},
+      "per_wavelength": [
+        {"wavelength": 0.4, "status": "completed", "reason": null, "observation_point": {"x": 10.0, "y": -0.814399051890498}, "common": true},
+        {"wavelength": 0.55, "status": "completed", "reason": null, "observation_point": {"x": 10.0, "y": -0.8152930376609606}, "common": true},
+        {"wavelength": 0.7, "status": "completed", "reason": null, "observation_point": {"x": 10.0, "y": -0.8156814440678855}, "common": true}
+      ]
+    }
+  ]
+}
+```
+
+- `wavelength_results[]` 与请求 `wavelengths_um` 顺序一致，每项含该波长的起始折射率 `n_start`、各界面后折射率 `n_next[]`（与界面顺序一致）、该波长自身命中数 `hit_count`、共通样本质心 / RMS 半径 / 相对首波长质心切向位移（共通样本为空时三者为 `null`）。
+- `rays[]` 按发射角从 `-a` 到 `+a` 排列，每条给出 `emission_angle_deg` 与归一化发射 `direction`，`per_wavelength[]` 按波长顺序逐条给出 `status` / `reason`（复用单光线追迹的状态与停止原因）、观察线前向交点 `observation_point`（无效时为 `null`）与 `common` 标记。
+- 参数校验：波长数量 2～9、互异且在 `[0.38, 0.78]` 微米内；柯西系数有限且所有计算折射率为有限正值；其余字段校验同光束评估（`0 < half_angle_deg < 90`、`2 ≤ sample_count ≤ 101`、中心方向与各法线非零），否则返回 `422`。
+
+服务地址：API 根路径 http://localhost:8000 ，交互式文档（可在线试调该接口）http://localhost:8000/docs 。
+
 ## 项目结构
 
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）
+  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、多波长柯西色散横向色差评估（n=A+B/λ²，共通样本质心/RMS/质心切向位移）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）
   comparison.py 两条已保存追迹的状态与分段对齐比较（统一浮点容差、缺段报告）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型
