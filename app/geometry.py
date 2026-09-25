@@ -303,6 +303,11 @@ def weighted_centroid(
     return (cx, cy)
 
 
+def cauchy_refractive_index(a: float, b: float, wavelength_um: float) -> float:
+    """柯西色散公式：n(λ) = A + B / λ²（λ 以微米计，B 的量纲为平方微米）。"""
+    return a + b / (wavelength_um * wavelength_um)
+
+
 def trace_ray(
     start: tuple[float, float],
     direction: tuple[float, float],

@@ -40,6 +40,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/alignment-sensitivities` | 基准追迹后逐界面将法线旋转 ±扰动角重新追迹，中心差分求观察线偏移对法线角度的导数（不入库） |
 | POST | `/api/focus-searches` | 光线只追迹一次，沿观察线单位法线等距平移扫描光斑质心/RMS，对命中集合相同的低谷黄金分割细化，返回 RMS 最小的焦点位置（不入库） |
 | POST | `/api/refractive-index-calibrations` | 固定其余界面只替换目标界面 `n_next`，沿观察线切向偏移均方残差等距扫描 + 低谷黄金分割细化，返回最优折射率与逐光线预测偏移/残差（不入库） |
+| POST | `/api/chromatic-beam-evaluations` | 复用光束扇形采样、顺序界面追迹与观察线前向求交，按柯西公式 `n=A+B/λ²` 为 2～9 个互异波长求各介质折射率并逐波长独立追迹，仅用所有波长均命中的同序号光线计算各波长质心、RMS 半径与相对首波长的质心切向位移（不入库） |
 
 ### 请求示例
 
@@ -784,12 +785,103 @@ curl -X POST http://localhost:8000/api/refractive-index-calibrations \
 
 服务地址：API 根路径 http://localhost:8000 ，交互式文档（可在线试调该接口）http://localhost:8000/docs 。
 
+## 横向色差评估（多波长光束）
+
+`POST /api/chromatic-beam-evaluations` 沿用光束评估的**起点、扇形采样（中心方向、对称半角、采样数）与观察线**输入，另收 **2～9 个互异的可见光波长**（微米，0.38～0.78）以及**起始介质和各顺序界面下一介质的柯西系数 A、B**，评估多波长光束在观察线上的横向色差。该接口为即时计算，结果不写入数据库。
+
+- **色散折射率**：每个波长下，起始介质与各界面下一介质的折射率均按柯西公式 `n = A + B/λ²`（λ 以微米计）独立计算；响应中逐波长回显 `n_start` 与 `n_next`（与请求界面一一对应）。
+- **逐波长独立追迹**：各波长复用同一套扇形采样（同一序号的光线在各波长下发射方向相同）、顺序界面追迹与观察线**前向**求交；`rays[].wavelengths[]` 逐光线逐波长返回 `status`、`reason` 与 `observation_point`（该波长下追迹未完成或未前向命中时为 `null`）。
+- **共通样本**：仅当**同序号**光线在**所有波长**下均追迹完成（`completed`）且出射段前向命中观察线时，该光线计入共通样本（逐光线回显 `common`，总数为 `common_count`）。
+- **逐波长统计**：各波长的 `centroid`、`rms_radius`（定义同光束评估）与 `centroid_shift` **只基于共通样本**计算；`centroid_shift` 为该波长质心相对**首波长**质心沿观察线单位切向量 `tangent`（法线逆时针旋转 90°）的有符号位移，首波长自身恒为 `0.0`。**共通样本为空时三者均为 `null`**。
+- **参数校验**：波长为 0.38～0.78 微米内 2～9 个**互异**有限值；柯西系数 `A`、`B` 必须为有限值；所有（波长 × 介质）组合按 `n = A + B/λ²` 算得的折射率必须为**正的有限值**；任一不满足返回 `422`。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/chromatic-beam-evaluations` | 多波长扇形采样、逐波长独立追迹，仅用所有波长均命中的同序号光线计算各波长质心、RMS 半径与相对首波长的质心切向位移 |
+
+### 横向色差评估请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/chromatic-beam-evaluations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "center_direction": {"x": 1, "y": 0.4},
+    "half_angle_deg": 5,
+    "sample_count": 7,
+    "wavelengths_um": [0.4, 0.55, 0.7],
+    "cauchy_start": {"A": 1.0, "B": 0.0},
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "cauchy": {"A": 1.52, "B": 0.006}},
+      {"point": {"x": 4, "y": 0}, "normal": {"x": 1, "y": 0}, "cauchy": {"A": 1.0, "B": 0.0}}
+    ],
+    "observation_line": {"point": {"x": 10, "y": 0}, "normal": {"x": 1, "y": 0}}
+  }'
+```
+
+### 横向色差评估响应说明
+
+```json
+{
+  "half_angle_deg": 5.0,
+  "sample_count": 7,
+  "ray_count": 7,
+  "common_count": 7,
+  "tangent": {"x": 0.0, "y": 1.0},
+  "wavelengths": [
+    {
+      "wavelength_um": 0.4,
+      "n_start": 1.0,
+      "n_next": [1.5575, 1.0],
+      "centroid": {"x": 10.0, "y": 3.7038101488641666},
+      "rms_radius": 0.6172962998841721,
+      "centroid_shift": 0.0
+    },
+    {
+      "wavelength_um": 0.55,
+      "n_start": 1.0,
+      "n_next": [1.5398347107438017, 1.0],
+      "centroid": {"x": 10.0, "y": 3.7098159682507696},
+      "rms_radius": 0.6183277434084226,
+      "centroid_shift": 0.006005819386603051
+    },
+    {
+      "wavelength_um": 0.7,
+      "n_start": 1.0,
+      "n_next": [1.5322448979591836, 1.0],
+      "centroid": {"x": 10.0, "y": 3.712443132392127},
+      "rms_radius": 0.6187801413161285,
+      "centroid_shift": 0.00863298352796038
+    }
+  ],
+  "rays": [
+    {
+      "emission_angle_deg": -5.0,
+      "direction": {"x": 0.9573123870088609, "y": 0.28905534708667296},
+      "common": true,
+      "wavelengths": [
+        {"wavelength_um": 0.4, "status": "completed", "reason": null, "observation_point": {"x": 10.0, "y": 2.793298103380285}},
+        {"wavelength_um": 0.55, "status": "completed", "reason": null, "observation_point": {"x": 10.0, "y": 2.797788975610804}},
+        {"wavelength_um": 0.7, "status": "completed", "reason": null, "observation_point": {"x": 10.0, "y": 2.7997520091035843}}
+      ]
+    }
+  ]
+}
+```
+
+- `ray_count`：实际追迹的光线数（等于 `sample_count`）；`common_count`：共通样本数（所有波长均完成追迹且前向命中观察线的同序号光线数）。
+- `tangent`：观察线单位切向量（法线逆时针旋转 90°），`centroid_shift` 的正方向。
+- `wavelengths[]` 与请求 `wavelengths_um` 一一对应：`n_start` / `n_next` 为该波长下按柯西公式算得的起始介质与各界面下一介质折射率；`centroid` / `rms_radius` / `centroid_shift` 仅基于共通样本，共通样本为空时均为 `null`。
+- `rays[]` 按发射角从 `-a` 到 `+a` 排列；`common` 表示该光线是否计入共通样本；`wavelengths[]` 与请求波长一一对应，逐波长给出 `status` / `reason` 与 `observation_point`（该波长下追迹未完成或未前向命中观察线时为 `null`）。
+
+服务地址：API 根路径 http://localhost:8000 ，交互式文档（可在线试调该接口）http://localhost:8000/docs 。
+
 ## 项目结构
 
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）
+  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）、柯西色散折射率（n=A+B/λ²）
   comparison.py 两条已保存追迹的状态与分段对齐比较（统一浮点容差、缺段报告）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型

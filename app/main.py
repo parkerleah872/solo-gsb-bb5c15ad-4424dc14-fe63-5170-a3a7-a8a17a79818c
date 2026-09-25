@@ -33,6 +33,12 @@ POST /api/focus-searches              光线只追迹一次，将观察线沿单
 POST /api/refractive-index-calibrations 固定其余界面只替换目标界面 n_next，沿观察线
                                       切向偏移均方残差扫描 + 低谷黄金分割细化，
                                       返回最优折射率与逐光线预测偏移/残差（不入库）
+POST /api/chromatic-beam-evaluations  复用光束扇形采样、顺序界面追迹与观察线前向
+                                      求交，按柯西公式 n=A+B/λ² 为 2～9 个互异
+                                      波长求各介质折射率并逐波长独立追迹，仅用
+                                      所有波长均完成追迹且命中观察线的同序号
+                                      光线计算各波长质心、RMS 半径与相对首波长
+                                      的质心切向位移（不入库）
 """
 from __future__ import annotations
 
@@ -45,6 +51,7 @@ from .comparison import compare_trace_records
 from .geometry import (
     aim_solutions,
     alignment_sensitivities,
+    cauchy_refractive_index,
     centroid_and_rms,
     focus_search,
     linear_least_squares,
@@ -67,6 +74,8 @@ from .schemas import (
     ApertureBeamRequest,
     BeamEvaluationOut,
     BeamRequest,
+    ChromaticBeamEvaluationOut,
+    ChromaticBeamRequest,
     DetectorPowerEvaluationOut,
     DetectorPowerRequest,
     FocusSearchOut,
@@ -813,4 +822,140 @@ def calibrate_refractive_index(req: RefractiveIndexCalibrationRequest) -> dict:
                 ],
             }
         ),
+    }
+
+
+@app.post("/api/chromatic-beam-evaluations", response_model=ChromaticBeamEvaluationOut)
+def evaluate_chromatic_beam(req: ChromaticBeamRequest) -> dict:
+    """多波长光束横向色差评估：各波长独立追迹，按共通命中光线统计光斑。
+
+    沿用光束评估的起点、扇形采样（中心方向、对称半角、采样数）与观察线输入；
+    另收 2～9 个互异的可见光波长（微米，0.38～0.78）以及起始介质和各顺序界面
+    下一介质的柯西系数 A、B，各波长下介质折射率按柯西公式 n = A + B/λ² 计算
+    （所有波长与介质组合均须为正的有限值，否则 422）。每个波长独立复用同一套
+    扇形采样、顺序界面追迹与观察线前向求交，同一序号的光线在各波长下发射
+    方向相同。
+
+    仅当同序号光线在所有波长下均追迹完成（completed）且出射段前向命中观察线
+    时，该光线计入共通样本；各波长的质心、RMS 半径与相对首波长质心的切向位移
+    （沿观察线单位切向量，即法线逆时针旋转 90°，响应中回显为 tangent）只基于
+    共通样本计算，共通样本为空时各统计量为 null。逐光线逐波长返回追迹状态与
+    观察线交点。该接口为即时计算，结果不写入数据库。
+    """
+    start = req.start.as_tuple()
+    obs_point = req.observation_line.point.as_tuple()
+    obs_normal = req.observation_line.normal.as_tuple()
+    nrm = normalize(obs_normal)
+    tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+
+    # 每个波长一套折射率：起始介质与各界面下一介质均按柯西公式求 n
+    wavelength_setups: list[
+        tuple[
+            float,
+            float,
+            list[tuple[tuple[float, float], tuple[float, float], float]],
+        ]
+    ] = []
+    for wavelength in req.wavelengths_um:
+        n_start = cauchy_refractive_index(
+            req.cauchy_start.A, req.cauchy_start.B, wavelength
+        )
+        interfaces = [
+            (
+                itf.point.as_tuple(),
+                itf.normal.as_tuple(),
+                cauchy_refractive_index(itf.cauchy.A, itf.cauchy.B, wavelength),
+            )
+            for itf in req.interfaces
+        ]
+        wavelength_setups.append((wavelength, n_start, interfaces))
+
+    # 逐光线逐波长追迹；hits[波长序号][光线序号] 记录命中观察线的交点
+    hits: list[dict[int, tuple[float, float]]] = [{} for _ in wavelength_setups]
+    raw_rays: list[tuple[float, tuple[float, float], list[dict]]] = []
+    for ray_index, (angle, direction) in enumerate(
+        sample_directions(
+            req.center_direction.as_tuple(), req.half_angle_deg, req.sample_count
+        )
+    ):
+        per_wavelength: list[dict] = []
+        for wi, (wavelength, n_start, interfaces) in enumerate(wavelength_setups):
+            segments, status, reason = trace_ray(
+                start, direction, n_start, interfaces
+            )
+            observation_point = None
+            if status == "completed":
+                observation_point = observation_intersection(
+                    segments, obs_point, obs_normal
+                )
+                if observation_point is not None:
+                    hits[wi][ray_index] = observation_point
+            per_wavelength.append(
+                {
+                    "wavelength_um": wavelength,
+                    "status": status,
+                    "reason": reason,
+                    "observation_point": (
+                        None
+                        if observation_point is None
+                        else {"x": observation_point[0], "y": observation_point[1]}
+                    ),
+                }
+            )
+        raw_rays.append((angle, direction, per_wavelength))
+
+    # 共通样本：所有波长均完成追迹且前向命中观察线的同序号光线
+    common_set = set(hits[0])
+    for wavelength_hits in hits[1:]:
+        common_set.intersection_update(wavelength_hits)
+    common_indices = sorted(common_set)
+
+    rays_out = [
+        {
+            "emission_angle_deg": angle,
+            "direction": {"x": direction[0], "y": direction[1]},
+            "common": ray_index in common_set,
+            "wavelengths": per_wavelength,
+        }
+        for ray_index, (angle, direction, per_wavelength) in enumerate(raw_rays)
+    ]
+
+    # 各波长统计仅基于共通样本；首波长质心为切向位移参考
+    wavelengths_out: list[dict] = []
+    reference_centroid: tuple[float, float] | None = None
+    for wi, (wavelength, n_start, interfaces) in enumerate(wavelength_setups):
+        stats = centroid_and_rms([hits[wi][i] for i in common_indices])
+        centroid = stats[0] if stats is not None else None
+        rms_radius = stats[1] if stats is not None else None
+        if wi == 0:
+            reference_centroid = centroid
+        centroid_shift = None
+        if centroid is not None and reference_centroid is not None:
+            centroid_shift = (
+                (centroid[0] - reference_centroid[0]) * tangent[0]
+                + (centroid[1] - reference_centroid[1]) * tangent[1]
+            )
+        wavelengths_out.append(
+            {
+                "wavelength_um": wavelength,
+                "n_start": n_start,
+                "n_next": [n_next for _point, _normal, n_next in interfaces],
+                "centroid": (
+                    None
+                    if centroid is None
+                    else {"x": centroid[0], "y": centroid[1]}
+                ),
+                "rms_radius": rms_radius,
+                "centroid_shift": centroid_shift,
+            }
+        )
+
+    return {
+        "half_angle_deg": req.half_angle_deg,
+        "sample_count": req.sample_count,
+        "ray_count": len(rays_out),
+        "common_count": len(common_indices),
+        "tangent": {"x": tangent[0], "y": tangent[1]},
+        "wavelengths": wavelengths_out,
+        "rays": rays_out,
     }
